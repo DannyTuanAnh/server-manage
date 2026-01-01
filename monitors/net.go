@@ -23,7 +23,7 @@ func (n *NetMonitor) Check(ctx context.Context) (string, error) {
 	netStart, err := net.IOCountersWithContext(ctx, false)
 
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("[Network Monitor] Could not retrieve Network info: %v\n", err)
 	}
 
 	if len(netStart) == 0 {

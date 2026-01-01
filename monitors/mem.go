@@ -23,7 +23,7 @@ func (m *MemMonitor) Check(ctx context.Context) (string, error) {
 	vmStart, err := mem.VirtualMemoryWithContext(ctx)
 
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("[Memory Monitor] Could not retrieve Memory info: %v\n", err)
 	}
 
 	return fmt.Sprintf("%.2f%%", vmStart.UsedPercent), nil

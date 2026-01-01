@@ -24,7 +24,7 @@ func (c *CPUMonitor) Check(ctx context.Context) (string, error) {
 	cpuStart, err := cpu.PercentWithContext(ctx, 1*time.Second, false)
 
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("[CPU Monitor] Could not retrieve CPU info: %w", err)
 	}
 
 	if len(cpuStart) == 0 {

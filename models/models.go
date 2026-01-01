@@ -18,6 +18,16 @@ type Monitor interface {
 	Name() string
 }
 
+type ProcessInfo struct {
+	PID        int32
+	Name       string
+	CPUPercent float64
+	RamUsed    uint64
+	RamPercent float64
+	RunTime    time.Duration
+	StartTime  time.Time
+}
+
 var (
 	Stat      = make(map[string]MonitorEvent)
 	StatMutex sync.Mutex
