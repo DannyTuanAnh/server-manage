@@ -36,19 +36,23 @@ func main() {
 		defer printTicker.Stop()
 
 		for range printTicker.C {
-			fmt.Println("\n================== System Status =================")
+			var output string
+			output += "\n================== System Status =================\n"
 
 			models.StatMutex.Lock()
 
 			for _, stat := range models.Stat {
 				if stat.Err != nil {
-					fmt.Printf("[%s] [%s] error: %v\n", stat.Timestamp.Format("02-01-2006 15:04:05"), stat.Name, stat.Err)
+					output += fmt.Sprintf("[%s] [%s] error: %v\n", stat.Timestamp.Format("02-01-2006 15:04:05"), stat.Name, stat.Err)
 					continue
 				}
-				fmt.Printf("[%s] [%s]: %s\n", stat.Timestamp.Format("02-01-2006 15:04:05"), stat.Name, stat.Value)
+				output += fmt.Sprintf("[%s] [%s]: %s\n", stat.Timestamp.Format("02-01-2006 15:04:05"), stat.Name, stat.Value)
 			}
 
 			models.StatMutex.Unlock()
+
+			// In một lần duy nhất (atomic)
+			fmt.Print(output)
 		}
 	}()
 

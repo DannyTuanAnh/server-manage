@@ -234,9 +234,9 @@ func (t *TopProcessMonitor) Check(ctx context.Context) (string, error) {
 	// Format output với cả 2 heaps
 	var result string
 	result += "\n\n================ Top 5 CPU Consuming Processes ================"
-	result += formatProcessList(reverseHeap(*cpuHeap))
+	result += formatProcessList(reverseHeap(cpuHeap))
 	result += "\n\n================ Top 5 Memory Consuming Processes ================"
-	result += formatProcessList(reverseHeap(*ramHeap))
+	result += formatProcessList(reverseHeap(ramHeap))
 
 	return result, nil
 }
@@ -275,11 +275,19 @@ func ema(prev, current, alpha float64) float64 {
 }
 
 // Hàm lấy phần tử từ heap theo thứ tự ngược lại
-func reverseHeap(h ProcessHeap) []models.ProcessInfo {
-	out := make([]models.ProcessInfo, len(h.items))
-	for i := len(h.items) - 1; i >= 0; i-- {
-		out[i] = heap.Pop(&h).(models.ProcessInfo)
+func reverseHeap(h *ProcessHeap) []models.ProcessInfo {
+	n := len(h.items)
+	if n == 0 {
+		return []models.ProcessInfo{}
 	}
+
+	out := make([]models.ProcessInfo, n)
+
+	// Pop tất cả elements ra
+	for i := n - 1; i >= 0; i-- {
+		out[i] = heap.Pop(h).(models.ProcessInfo)
+	}
+
 	return out
 }
 
