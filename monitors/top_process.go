@@ -241,14 +241,6 @@ func (t *TopProcessMonitor) Check(ctx context.Context) (string, error) {
 	return result, nil
 }
 
-// Lấy top N tiến trình từ danh sách đã sắp xếp
-func topN(list []models.ProcessInfo, n int) []models.ProcessInfo {
-	if len(list) < n {
-		return list
-	}
-	return list[:n]
-}
-
 // Định dạng danh sách tiến trình thành chuỗi bảng
 func formatProcessList(list []models.ProcessInfo) string {
 	if len(list) == 0 {
