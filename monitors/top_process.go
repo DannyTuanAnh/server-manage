@@ -1,8 +1,11 @@
 package monitors
 
 import (
+	"container/heap"
 	"context"
 	"fmt"
+	"math"
+	"runtime"
 	"sync"
 	"time"
 
@@ -11,20 +14,160 @@ import (
 	"github.com/shirou/gopsutil/v4/process"
 )
 
+type job struct {
+	proc *process.Process
+}
+
+// Hệ số làm mượt EMA
+// α=1−e^−Δt​/τ
+
+type processSample struct {
+	LastCPUTime float64
+	LastSample  time.Time
+	EMA         float64
+	LastSeen    time.Time //for TTL
+}
+
 type TopProcessMonitor struct {
 	cpuThreshold float64
 	ramThreshold float64
+
+	emaWindow time.Duration
+
+	ttl time.Duration
+
+	workers   int
+	batchSize int
+	topK      int
+
+	cache  sync.Map // map[int32]processSample
+	cursor int
 }
 
 func NewTopProcessMonitor(cpuThreshold, ramThreshold float64) *TopProcessMonitor {
 	return &TopProcessMonitor{
 		cpuThreshold: cpuThreshold,
 		ramThreshold: ramThreshold,
+
+		emaWindow: 15 * time.Second,
+
+		ttl: 2 * time.Minute,
+
+		workers:   min(4, runtime.NumCPU()/2),
+		batchSize: 20,
+		topK:      5,
 	}
 }
 
 func (t *TopProcessMonitor) Name() string {
 	return "TopProcess"
+}
+
+// Thiết lập cửa sổ thời gian cho EMA
+func (t *TopProcessMonitor) SetEMAWindow(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	t.emaWindow = d
+}
+
+// Lấy một mảng process dựa trên con trỏ hiện tại theo batch
+func (t *TopProcessMonitor) sampleBatch(process []*process.Process) []*process.Process {
+	if len(process) == 0 {
+		return nil
+	}
+
+	start := t.cursor
+	end := t.cursor + t.batchSize
+
+	if end > len(process) {
+		end = len(process)
+	}
+
+	batch := process[start:end]
+	t.cursor = end % len(process)
+
+	return batch
+}
+
+func (t *TopProcessMonitor) collectProcess(ctx context.Context, proc *process.Process, out chan<- models.ProcessInfo, totalMem uint64) {
+	pid := proc.Pid
+	now := time.Now()
+
+	cpuTimes, err := proc.TimesWithContext(ctx)
+	if err != nil {
+		return
+	}
+
+	memInfo, err := proc.MemoryInfoWithContext(ctx)
+	if err != nil {
+		return
+	}
+
+	// Tự tính tổng CPU time thay vì dùng Total() vì đã bị
+	// deprecated (không khuyến khích dùng) trong phiên bản mới của thư viện gopsutil
+	// Total() là hàm nội bộ, tác giả thư viện không muốn người dùng gọi trực tiếp nữa.
+	totalCPUTime := cpuTimes.User + cpuTimes.System
+
+	var prev processSample
+
+	if val, ok := t.cache.Load(pid); ok {
+		prev = val.(processSample)
+	}
+
+	deltaCPU := totalCPUTime - prev.LastCPUTime
+	deltaTime := now.Sub(prev.LastSample).Seconds()
+
+	if !prev.LastSample.IsZero() && deltaTime > 0 {
+		rawCPU := (deltaCPU / deltaTime) * 100
+
+		alpha := emaAlpha(deltaTime, t.emaWindow)
+		smoothed := ema(prev.EMA, rawCPU, alpha)
+
+		ramPercent := float64(memInfo.RSS) / float64(totalMem) * 100
+
+		if smoothed >= t.cpuThreshold || ramPercent >= t.ramThreshold {
+			name, err := proc.NameWithContext(ctx)
+			if err != nil || name == "" {
+				name = fmt.Sprintf("pid-%d", pid)
+			}
+
+			create, _ := proc.CreateTimeWithContext(ctx)
+			start := time.Unix(create/1000, 0)
+
+			out <- models.ProcessInfo{
+				PID:        pid,
+				Name:       name,
+				CPUPercent: smoothed,
+				RamUsed:    memInfo.RSS,
+				RamPercent: ramPercent,
+				StartTime:  start,
+				RunTime:    time.Since(start),
+			}
+		}
+
+		prev.EMA = smoothed
+	}
+
+	t.cache.Store(pid, processSample{
+		LastCPUTime: totalCPUTime,
+		LastSample:  now,
+		LastSeen:    now,
+		EMA:         prev.EMA,
+	})
+
+}
+
+func (t *TopProcessMonitor) cleanup() {
+	now := time.Now()
+
+	t.cache.Range(func(key, value interface{}) bool {
+		s := value.(processSample)
+		if now.Sub(s.LastSeen) > t.ttl {
+			t.cache.Delete(key)
+		}
+		return true
+	})
 }
 
 func (t *TopProcessMonitor) Check(ctx context.Context) (string, error) {
@@ -33,86 +176,83 @@ func (t *TopProcessMonitor) Check(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("[Get Top Process] Could not retrieve virtual memory info: %v\n", err)
 	}
 
-	totalMemory := vmStat.Total
-
 	processes, err := process.ProcessesWithContext(ctx)
 	if err != nil {
 		return "", fmt.Errorf("[Get Top Process] Could not retrieve process list: %v\n", err)
 	}
 
-	var (
-		mu           sync.Mutex
-		wg           sync.WaitGroup
-		topProcesses []models.ProcessInfo
-	)
-
-	for _, p := range processes {
-		wg.Add(1)
-
-		go func(proc *process.Process) {
-			defer wg.Done()
-
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				name, err := proc.NameWithContext(ctx)
-				if err != nil {
-					return
-				}
-
-				cpuPercent, err := proc.CPUPercentWithContext(ctx)
-				if err != nil {
-					return
-				}
-
-				//RSS: Resident Set Size => Ram thực sự mà tiến trình đang sử dụng
-				//VMS: Virtual Memory Size => Tổng bộ nhớ ảo mà hệ điều hành cấp phát cho tiến trình
-				memInfo, err := proc.MemoryInfoWithContext(ctx)
-				if err != nil {
-					return
-				}
-
-				// Tính phần trăm RAM sử dụng của tiến trình
-				ramPercent := float64(memInfo.RSS) / float64(totalMemory) * 100
-
-				//trả về đơn vị là milliseconds
-				createTime, err := proc.CreateTimeWithContext(ctx)
-				if err != nil {
-					return
-				}
-
-				// Tính thời gian chạy của tiến trình, từ milliseconds sang seconds
-				startTime := time.Unix(createTime/1000, 0)
-				runningTime := time.Since(startTime)
-
-				if cpuPercent > t.cpuThreshold || ramPercent > t.ramThreshold {
-					mu.Lock()
-					topProcesses = append(topProcesses, models.ProcessInfo{
-						PID:        proc.Pid,
-						Name:       name,
-						CPUPercent: cpuPercent,
-						RamUsed:    memInfo.RSS,
-						RamPercent: ramPercent,
-						RunTime:    runningTime,
-						StartTime:  startTime,
-					})
-					mu.Unlock()
-				}
-
-			}
-		}(p)
-
+	batch := t.sampleBatch(processes)
+	if len(batch) == 0 {
+		return "", nil
 	}
 
-	wg.Wait()
+	out := make(chan models.ProcessInfo, len(batch))
+	jobs := make(chan *process.Process)
 
-	return formatProcessList(topProcesses), nil
+	var wg sync.WaitGroup
+	for i := 0; i < t.workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for p := range jobs {
+				t.collectProcess(ctx, p, out, vmStat.Total)
+			}
+		}()
+	}
+
+	go func() {
+		for _, p := range batch {
+			jobs <- p
+		}
+		close(jobs)
+		wg.Wait()
+		close(out)
+	}()
+
+	// Tạo 2 heaps: 1 cho CPU, 1 cho RAM
+	cpuHeap := &ProcessHeap{sortBy: "cpu"}
+	ramHeap := &ProcessHeap{sortBy: "ram"}
+	heap.Init(cpuHeap)
+	heap.Init(ramHeap)
+
+	for p := range out {
+		// Push vào CPU heap
+		heap.Push(cpuHeap, p)
+		if cpuHeap.Len() > t.topK {
+			heap.Pop(cpuHeap)
+		}
+
+		// Push vào RAM heap
+		heap.Push(ramHeap, p)
+		if ramHeap.Len() > t.topK {
+			heap.Pop(ramHeap)
+		}
+	}
+
+	t.cleanup()
+
+	// Format output với cả 2 heaps
+	var result string
+	result += "\n\n================ Top 5 CPU Consuming Processes ================"
+	result += formatProcessList(reverseHeap(*cpuHeap))
+	result += "\n\n================ Top 5 Memory Consuming Processes ================"
+	result += formatProcessList(reverseHeap(*ramHeap))
+
+	return result, nil
 }
 
+// Lấy top N tiến trình từ danh sách đã sắp xếp
+func topN(list []models.ProcessInfo, n int) []models.ProcessInfo {
+	if len(list) < n {
+		return list
+	}
+	return list[:n]
+}
+
+// Định dạng danh sách tiến trình thành chuỗi bảng
 func formatProcessList(list []models.ProcessInfo) string {
 	if len(list) == 0 {
-		return "No high resource processes"
+		return "\n\nNo high resource processes\n"
 	}
 
 	var result string
@@ -124,4 +264,30 @@ func formatProcessList(list []models.ProcessInfo) string {
 	}
 	result += "\n└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 	return result
+}
+
+// Hàm tính EMA
+func ema(prev, current, alpha float64) float64 {
+	if prev == 0 {
+		return current
+	}
+	return alpha*current + (1-alpha)*prev
+}
+
+// Hàm lấy phần tử từ heap theo thứ tự ngược lại
+func reverseHeap(h ProcessHeap) []models.ProcessInfo {
+	out := make([]models.ProcessInfo, len(h.items))
+	for i := len(h.items) - 1; i >= 0; i-- {
+		out[i] = heap.Pop(&h).(models.ProcessInfo)
+	}
+	return out
+}
+
+// Hàm tính hệ số alpha cho EMA dựa trên cửa sổ thời gian
+func emaAlpha(deltaSeconds float64, window time.Duration) float64 {
+	tau := window.Seconds()
+	if tau <= 0 {
+		return 1
+	}
+	return 1 - math.Exp(-deltaSeconds/tau)
 }

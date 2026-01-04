@@ -16,7 +16,8 @@ func main() {
 	memMonitor := monitors.NewMemMonitor()
 	netMonitor := monitors.NewNetMonitor()
 	diskMonitor := monitors.NewDiskMonitor()
-	topProcessMonitor := monitors.NewTopProcessMonitor(5, 5)
+	topProcessMonitor := monitors.NewTopProcessMonitor(0, 0)
+	topProcessMonitor.SetEMAWindow(20 * time.Second)
 
 	service := processor.NewMonitorService(ctx, 2*time.Second, cpuMonitor, memMonitor, netMonitor, diskMonitor, topProcessMonitor)
 
@@ -47,20 +48,14 @@ func main() {
 				fmt.Printf("[%s] [%s]: %s\n", stat.Timestamp.Format("02-01-2006 15:04:05"), stat.Name, stat.Value)
 			}
 
-			// top, err := processor.GetTopProcess(ctx)
-			// if err != nil {
-			// 	fmt.Printf("Error retrieving top process: %v\n", err)
-			// }
-			// fmt.Print(top)
-
 			models.StatMutex.Unlock()
 		}
 	}()
 
 	service.Start()
 
-	time.Sleep(10 * time.Second)
+	// time.Sleep(30 * time.Second)
 
-	service.Stop()
 	service.Wait()
+	service.Stop()
 }
